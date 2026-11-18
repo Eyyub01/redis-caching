@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Shop bestsellers</title>
+  <style>
+    body { font-family: sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
+    table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+    th, td { text-align: left; padding: 6px; border-bottom: 1px solid #ddd; }
+    #status { color: #555; margin: 8px 0; }
+    #timings {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: 12px 0;
+      min-height: 28px;
+    }
+    .chip {
+      font-size: 12px;
+      padding: 4px 8px;
+      border-radius: 4px;
+      color: #fff;
+    }
+    .chip.db { background: #e67e22; }
+    .chip.cache { background: #27ae60; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  </style>
+</head>
+<body>
+  <h1>Shop bestsellers</h1>
+  <p id="status">Loading...</p>
+  <div id="timings"></div>
+
+  <table>
+    <thead>
+      <tr><th>Product</th><th>Total sold</th><th>Bestseller</th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <div class="actions">
+    <button id="loadTen">Load 20 at once</button>
+    <button id="order">Place order</button>
+  </div>
+  <p id="message"></p>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let busy = false;
+
+    function setBusy(on) {
+      busy = on;
+      $('loadTen').disabled = on;
+      $('order').disabled = on;
+    }
+
+    function render(products) {
+      const rows = $('rows');
+      rows.innerHTML = '';
+      for (const p of products) {
+        const tr = document.createElement('tr');
+        tr.innerHTML =
+          '<td>' + p.name + '</td>' +
+          '<td>' + p.totalSold + '</td>' +
+          '<td>' + (p.bestseller ? 'Yes' : '') + '</td>';
+        rows.appendChild(tr);
+      }
+    }
+
+    async function fetchStats() {
+      const start = performance.now();
+      const res = await fetch('/products', { cache: 'no-store' });
+      if (!res.ok) throw new Error('bad status');
+      const products = await res.json();
+      const ms = Math.round(performance.now() - start);
+      const fromCache = res.headers.get('X-Cache') === 'HIT';
+      return { products, ms, fromCache };
+    }
+
+    function addChip(result) {
+      const chip = document.createElement('span');
+      chip.className = 'chip ' + (result.fromCache ? 'cache' : 'db');
+      chip.textContent = result.ms + ' ms';
+      $('timings').appendChild(chip);
+    }
+
+    async function loadOnce() {
+      if (busy) return;
+      setBusy(true);
+      $('timings').innerHTML = '';
+      $('message').textContent = '';
+      try {
+        const result = await fetchStats();
+        render(result.products);
+        addChip(result);
+        const source = result.fromCache ? 'cache' : 'database';
+        $('status').textContent = result.ms + ' ms · Served from: ' + source;
+      } catch {
+        $('status').textContent = 'Could not load bestsellers. Is the server running?';
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function loadTen() {
+      if (busy) return;
+      setBusy(true);
+      $('timings').innerHTML = '';
+      $('status').textContent = '20 visitors loading at the same time…';
+      const start = performance.now();
+      try {
+        const results = await Promise.all(Array.from({ length: 20 }, () => fetchStats()));
+        const total = Math.round(performance.now() - start);
+        render(results[0].products);
+        results.forEach(addChip);
+        $('status').textContent = `All 20 done in ${total.toLocaleString()} ms`;
+      } catch {
+        $('status').textContent = 'Could not load bestsellers. Is the server running?';
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    $('loadTen').addEventListener('click', loadTen);
+
+    $('order').addEventListener('click', async () => {
+      if (busy) return;
+      setBusy(true);
+      $('message').textContent = '';
+      const productId = Math.floor(Math.random() * 20) + 1;
+      try {
+        await fetch('/orders', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ productId, quantity: 1 }),
+        });
+        $('message').textContent = 'Order placed. Reload the table to see the change.';
+      } finally {
+        setBusy(false);
+      }
+    });
+
+    loadOnce();
+  </script>
+</body>
+</html>
