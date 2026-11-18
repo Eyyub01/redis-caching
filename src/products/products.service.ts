@@ -1,4 +1,12 @@
-import { Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import {
+  HttpException,
+  HttpStatus,
+  Inject,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
+import { Redis } from 'ioredis';
 import { Pool } from 'pg';
 
 export interface Product {
@@ -37,11 +45,17 @@ const products: Product[] = [
   { id: 20, name: 'Microphone', views: 0 },
 ];
 
+const STATS_KEY = 'products:stats';
+const TOP_KEY = 'products:top';
+
 @Injectable()
 export class ProductsService {
   private readonly logger = new Logger(ProductsService.name);
 
-  constructor(@Inject('PG') private readonly pool: Pool) {}
+  constructor(
+    @Inject('PG') private readonly pool: Pool,
+    @Inject('REDIS') private readonly redis: Redis,
+  ) {}
 
   async computeStats(): Promise<ProductStats[]> {
     this.logger.log('Computing stats from database');
@@ -76,9 +90,19 @@ export class ProductsService {
     return stats;
   }
 
-  async findAll(): Promise<ProductStats[]> {
-    // Class step: check Redis first
-    return this.computeStats();
+  async findAll(): Promise<{ data: ProductStats[]; hit: boolean }> {
+    // GET: read cached stats; null if the key is missing or expired.
+    const cached = await this.redis.get(STATS_KEY);
+    if (cached) {
+      this.logger.log('CACHE HIT');
+      return { data: JSON.parse(cached), hit: true };
+    }
+
+    this.logger.log('CACHE MISS');
+    const stats = await this.computeStats();
+    // SET ... EX 60: store stats and let Redis remove the key after 60 seconds.
+    await this.redis.set(STATS_KEY, JSON.stringify(stats), 'EX', 60);
+    return { data: stats, hit: false };
   }
 
   async placeOrder(productId: number, quantity: number) {
@@ -87,23 +111,44 @@ export class ProductsService {
        RETURNING product_id, quantity`,
       [productId, quantity],
     );
-    // Class step: invalidate Redis cache here
+    // DEL: a new order changes totals, so cached stats would be wrong.
+    await this.redis.del(STATS_KEY);
     return rows[0];
   }
 
-  addView(productId: number) {
+  async addView(productId: number, ip: string) {
     const product = products.find((p) => p.id === productId);
     if (!product) {
       throw new NotFoundException('Product not found');
     }
-    product.views++;
-    return { id: product.id, views: product.views };
+
+    const rateKey = `ratelimit:${ip}`;
+    // INCR: count this request; the key starts at 1 on the first hit.
+    const count = await this.redis.incr(rateKey);
+    if (count === 1) {
+      // EXPIRE: start a 60 second window on the first request.
+      await this.redis.expire(rateKey, 60);
+    }
+    if (count > 5) {
+      throw new HttpException('Too many requests', HttpStatus.TOO_MANY_REQUESTS);
+    }
+
+    // ZINCRBY: add 1 to this product's score on the views leaderboard.
+    const views = await this.redis.zincrby(TOP_KEY, 1, productId);
+    return { id: product.id, views: Number(views) };
   }
 
-  topProducts(limit: number) {
-    return [...products]
-      .sort((a, b) => b.views - a.views)
-      .slice(0, limit)
-      .map((p) => ({ id: p.id, name: p.name, views: p.views }));
+  async topProducts(limit: number) {
+    // ZREVRANGE ... WITHSCORES: highest scores first, as [id, score, id, score, ...].
+    const result = await this.redis.zrevrange(TOP_KEY, 0, limit - 1, 'WITHSCORES');
+
+    const top: { id: number; name: string; views: number }[] = [];
+    for (let i = 0; i < result.length; i += 2) {
+      const product = products.find((p) => p.id === Number(result[i]));
+      if (product) {
+        top.push({ id: product.id, name: product.name, views: Number(result[i + 1]) });
+      }
+    }
+    return top;
   }
 }
